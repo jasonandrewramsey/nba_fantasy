@@ -1,0 +1,172 @@
+####Package Import
+library(lpSolveAPI)
+library(lpSolve)
+source('H:/NBA/Scripts/Package_Import.R')
+
+#Function to start an automated browser port
+start_selenium <- function() {
+  assign("rD", { tryCatch({ rsDriver(port = as.integer(4000+sample(1:3000,1)), 
+                                     browser = "chrome",
+                                     version = "3.141.5",
+                                     chromever = "78.0.3904.105") },
+                          error = function(e) { rsDriver(port = as.integer(4000+sample(1:3000,1)), 
+                                                         browser = "chrome",
+                                                         version = "3.141.5",
+                                                         chromever = "76.0.3809.12") }) },
+         envir = .GlobalEnv)
+  
+  assign("remDr", rD$client, envir = .GlobalEnv)
+}
+
+login_fo <- function() {
+  #Go to the Football Outsiders log-in page
+  remDr$navigate("https://www.footballoutsiders.com/user/login?destination=home")
+  
+  #Send username
+  username <- remDr$findElement(using = "id", value = "edit-name")
+  username$clearElement()
+  username$sendKeysToElement(list("thankscyalater"))
+  
+  #Send password and Enter
+  passwd <- remDr$findElement(using = "id", value = "edit-pass")
+  passwd$clearElement()
+  passwd$sendKeysToElement(list("football17", "\uE007"))
+}
+
+login_fantasy_crunch <- function() {
+  #Go to the Football Outsiders log-in page
+  remDr$navigate('https://www.fantasycruncher.com/login?referer=/index.php?pages=lineup-cruncher/fanduel/NBA/2019-12-25')
+  
+  #Send username
+  username <- remDr$findElement(using = "id", value = 'user_email')
+  username$clearElement()
+  username$sendKeysToElement(list('d1pper@hotmail.com'))
+  
+  #Send password and Enter
+  passwd <- remDr$findElement(using = "id", value = 'user_password')
+  passwd$clearElement()
+  passwd$sendKeysToElement(list('Highbury2424', "\uE007"))
+}
+
+get_data <- function(pid) {
+  url <- paste0('https://www.fantasycruncher.com/ajax/player-stats.php?playerId=', pid, '&site=fanduel&limit=10000&offset=20')
+  remDr$navigate(as.character(url))
+  page <- 
+    remDr$getPageSource() %>%
+    map(1) %>%
+    unlist() %>%
+    read_html %>%
+    html_text
+  
+  data <- fromJSON(page)
+  
+  cbind.data.frame(
+    data$stats,
+    as.data.frame(data$gen)
+  ) %>%
+    mutate(PlayerId = pid) %>%
+    filter(League == 'NBA')
+} 
+
+#Import data
+import_nba_fantasy_crunch_data <- function(data) {
+  #Establish connection to mongodb
+  username <- 'thatsmrlongcut'
+  password <- 'football17'
+  
+  con <-
+    mongo(
+      collection = "NFL",
+      db = "FANDUEL_NBA",
+      url = paste0("mongodb+srv://", username, ":", password, '@nfl-bsxce.mongodb.net/test?retryWrites=true&w=majority')
+    )
+  
+  con$insert(data)
+}
+
+#####
+# ~ Current players expectations and salaries
+#####
+start_selenium()
+Sys.sleep(1)
+login_fantasy_crunch()
+Sys.sleep(3)
+remDr$navigate('https://www.fantasycruncher.com/lineup-cruncher/fanduel/NBA/2019-12-25')
+
+cur_tbl <-
+remDr$getPageSource() %>%
+  map(1) %>%
+  unlist %>%
+  read_html() %>%
+  html_nodes(xpath =paste0('//*[@id="ff"]')) %>%
+  html_table(fill = T)
+cur_tbl <- cur_tbl[[1]]
+colnames(cur_tbl)[1] <- 'PlayerName'
+
+#Create the data frame to optimize
+PlayerPool <-
+  cur_tbl %>%
+  dplyr::select(PlayerName, Pos, Salary, Proj = `FC Proj`, Team) %>%
+  mutate(is_PG = ifelse(Pos == "PG", 1, 0),
+         is_SG = ifelse(Pos == "SG", 1, 0),
+         is_SF = ifelse(Pos == "SF", 1, 0),
+         is_PF = ifelse(Pos == "PF", 1, 0),
+         is_C = ifelse(Pos == "C", 1, 0),
+         scalar = 1) %>%
+  filter(Proj > 0)
+
+
+df <-
+  mongo(
+    collection = "NFL",
+    db = "FANDUEL_NBA",
+    url = paste0("mongodb+srv://thatsmrlongcut:football17@nfl-bsxce.mongodb.net/test?retryWrites=true&w=majority")
+  )$find() %>%
+  mutate(Fantasy_Proj = as.numeric(Fantasy_Proj),
+         Fantasy_Act = as.numeric(Fantasy_Act),
+         Date = as.Date(Game_Date)) %>%
+  filter(Fantasy_Act > 0,
+         PlayerName %in% PlayerPool$PlayerName)
+
+PlayerDist <-
+  df %>%
+  group_by(PlayerPos, PlayerName) %>%
+  summarise(avg_error = mean((Fantasy_Proj - Fantasy_Act), na.rm = T),
+            stdev_error = sd((Fantasy_Proj - Fantasy_Act), na.rm = T)) %>%
+  as.data.frame %>%
+  left_join(PlayerPool, by = 'PlayerName') %>%
+  filter(Team %in% c('CLE', 'BOS') == F)
+
+#You will need to speed this up -- assign multiple cores to do this task
+cl <- makeCluster(detectCores(), type = "SOCK")
+
+#Export the required objects to the other clusters
+clusterExport(cl, list(
+  "PlayerDist"
+))
+
+#Cluster apply the trailing average composition
+optimizerr <-
+  clusterApply(cl, 1:1000000, function(z) {
+    library(lpSolve)
+    temp_file <- PlayerDist
+    temp_file$Proj <- 
+      do.call("c", lapply(1:nrow(temp_file), function(x) {
+        temp_file$Proj[x] + rnorm(1, mean=temp_file$avg_error[x], sd=temp_file$stdev_error[x])
+      }))
+    
+    #Objective
+    knapsack.obj  <- temp_file$Proj
+    
+    #Constraints
+    knapsack.con <- matrix(c(temp_file$Salary, temp_file$is_PG, temp_file$is_SG, temp_file$is_SF, temp_file$is_PF, temp_file$is_C), nrow = 6, byrow=T)
+    knapsack.dir <- c("<=", "==", "==", "==", "==", "==")
+    knapsack.rhs <- c(60000, 2, 2, 2, 2, 1)
+    
+    knapsack.solution <- lp("max", knapsack.obj, knapsack.con, knapsack.dir, knapsack.rhs, all.bin = TRUE)
+    
+    paste(temp_file$PlayerName[which(knapsack.solution$solution == 1)], collapse = ' : ')
+  })
+
+#Stop the cluster
+stopCluster(cl)
