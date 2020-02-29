@@ -1,0 +1,87 @@
+#First call the package import/load script
+source('H:/NBA/Scripts/Package_Import.R')
+
+#Function to start an automated browser port
+start_selenium <- function() {
+  assign("rD", { tryCatch({ rsDriver(port = as.integer(4000+sample(1:3000,1)), 
+                                     browser = "chrome",
+                                     version = "3.141.5",
+                                     chromever = "78.0.3904.105") },
+                          error = function(e) { rsDriver(port = as.integer(4000+sample(1:3000,1)), 
+                                                         browser = "chrome",
+                                                         version = "3.141.5",
+                                                         chromever = "76.0.3809.12") }) },
+         envir = .GlobalEnv)
+  
+  assign("remDr", rD$client, envir = .GlobalEnv)
+}
+
+login_fantasy_crunch <- function() {
+  #Go to the Football Outsiders log-in page
+  remDr$navigate('https://www.fantasycruncher.com/login?referer=/index.php?pages=lineup-cruncher/fanduel/NBA/2019-12-25')
+  
+  #Send username
+  username <- remDr$findElement(using = "id", value = 'user_email')
+  username$clearElement()
+  username$sendKeysToElement(list('d1pper@hotmail.com'))
+  
+  #Send password and Enter
+  passwd <- remDr$findElement(using = "id", value = 'user_password')
+  passwd$clearElement()
+  passwd$sendKeysToElement(list('Highbury2424', "\uE007"))
+}
+
+#####
+# ~ Current players expectations and salaries
+#####
+
+start_selenium()
+Sys.sleep(1)
+login_fantasy_crunch()
+Sys.sleep(3)
+remDr$navigate('https://www.fantasycruncher.com/lineup-cruncher/fanduel/NBA/2019-12-25')
+
+cur_tbl <-
+  remDr$getPageSource() %>%
+  map(1) %>%
+  unlist %>%
+  read_html() %>%
+  html_nodes(xpath =paste0('//*[@id="ff"]')) %>%
+  html_table(fill = T)
+cur_tbl <- cur_tbl[[1]]
+colnames(cur_tbl)[1] <- 'PlayerName'
+
+#####
+# ~ Injury Report
+#####
+
+#Read in the injuries
+df <- 
+  'https://www.cbssports.com/nba/injuries/' %>%
+  read_html() %>%
+  html_table(fill = T) %>%
+  invoke(rbind, .)
+
+#Function to structure player names
+df$Player <- do.call("c", lapply(1:nrow(df), function(x) {
+  txt <- df$Player[x]
+  pos <- str_locate(txt, "[\n]")[1,1] %>% as.numeric
+  str_trim(gsub("[\n]", "", substr(txt, start = pos, stop = nchar(txt))))
+}))
+
+
+cur_tbl <- cur_tbl %>% filter(PlayerName %in% df$Player == F)
+
+#####
+# ~ Inject into the 'NBA_FANDUEL_CURRENT_DAY_PLAYERS'
+#####
+
+con <-
+  mongo(
+    collection = "NFL",
+    db = "NBA_FANDUEL_CURRENT_DAY_PLAYERS",
+    url = paste0("mongodb+srv://thatsmrlongcut:football17@nfl-bsxce.mongodb.net/test?retryWrites=true&w=majority")
+  )
+con$drop()
+con$insert(cur_tbl)
+rm(con)
